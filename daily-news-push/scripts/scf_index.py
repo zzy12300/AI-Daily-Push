@@ -18,6 +18,7 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import math
 import os
 import random
 import re
@@ -42,7 +43,7 @@ def call_deepseek(api_key, prompt):
         "model": DEEPSEEK_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.8,
-        "max_tokens": 1200,
+        "max_tokens": 4000,
     }).encode("utf-8")
     req = urllib.request.Request(
         DEEPSEEK_URL,
@@ -740,11 +741,14 @@ TASKS = {
             "严格针对 {month}月{day}日 这一天，只列出「确定在这一天」的节日、纪念日、节气"
             "（公历和农历都要考虑）。注意：如果某个节日/纪念日不是 {month}月{day}日，"
             "绝对不要列出来，宁缺毋滥。\n"
+            "如果 {month}月{day}日 恰好是二十四节气中的某一个，必须把这个节气单独列出来，"
+            "而且简介要写详细（80~150 字）：说明它是第几个节气、大致交节时间、"
+            "气候与物候特征、对应的农事活动、民间习俗，以及它在中国农耕文化中的意义。\n"
             "对每一个都给出：它的诞生日期（或设立时间）和它纪念/庆祝的意义。"
             "每个节日单独一段，格式严格如下（每段两行：一行节日名，一行简介）：\n"
             "节日：世界问候日\n简介：1973年由澳大利亚的姆可马克与米切尔两兄弟发起，将11月21日定为世界问候日，呼吁人们用一句问候传递和平与善意，现已在全球140多个国家流传。\n"
             "注意：简介里必须明确写出「将X月X日定为该节日」这类具体日期，"
-            "且这个 X月X日 必须就是 {month}月{day}日。"
+            "且这个 X月X日 必须就是 {month}月{day}日（节气则要写出交节日期 {month}月{day}日）。"
             "如果你不能确定某个节日的日期恰好是 {month}月{day}日，就不要列它。\n"
             "直接输出，不要额外说明。"
         ),
@@ -791,7 +795,10 @@ def parse_news(text, default_title="今日 AI 新闻"):
 
 
 def parse_festivals(text):
-    """解析「节日简介」区块，返回 [{name, intro}]"""
+    """解析「节日简介」区块，返回 [{name, intro}]
+    简介允许跨多行：遇到下一个「节日：」或区块标记（【、第…）才结束，
+    中间不以「节日/简介/【/第/数字编号」开头的行会拼接到上一条简介里
+    （模型偶尔把气候、习俗写到第二行，旧版只取第一行会丢内容）。"""
     result = []
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     current = None
@@ -799,70 +806,258 @@ def parse_festivals(text):
     for line in lines:
         if line.startswith("节日：") or line.startswith("节日:"):
             in_section = True
-            current = {"name": line.split("：", 1)[-1].split(":", 1)[-1].strip(), "intro": ""}
+            current = {"name": line.split("：", 1)[-1].split(":", 1)[-1].strip(),
+                       "intro": ""}
             result.append(current)
         elif in_section and (line.startswith("简介：") or line.startswith("简介:")):
             if current is not None:
                 current["intro"] = line.split("：", 1)[-1].split(":", 1)[-1].strip()
-        elif in_section and current is not None and line.startswith(("【", "第")):
+        elif line.startswith(("【", "第")):
             # 遇到新的大区块标记，停止
             in_section = False
+            current = None
+        elif in_section and current is not None:
+            if re.match(r"^\d+[\.、]", line):
+                # 形如「1. 1783年 …」，属于历史事件区，说明已离开节日区
+                in_section = False
+                current = None
+            elif current.get("intro"):
+                # 简介续行（上限 400 字，避免异常输入把整段正文吸进来）
+                if len(current["intro"]) < 400:
+                    current["intro"] += line
     return [f for f in result if f.get("name")]
 
 
 def merge_festivals(deepseek_festivals, today_date):
     """合并节日来源，保证准确：
     1. 先取「权威注册表」里当天（月,日）的节日（名称 + 简介），这些 100% 准确、优先采用。
-    2. DeepSeek 生成的节日，逐个做日期校验：简介里必须能提取到「X月X日」且等于今天，
-       否则判定为错误节日丢弃；名称与注册表重复的，用注册表版本覆盖。
-    3. 注册表里没有、但 DeepSeek 生成且通过日期校验的，才补充进来。
-    返回 [{name, intro}]（按 注册表优先 的顺序）。"""
+    2. DeepSeek 生成的节日，逐个做校验：
+       - 名字归一化后若是「节气」，必须等于今天的实际节气（防止把别的节气说成今天）；
+       - 简介里必须能提取到「X月X日」且等于今天（与注册表重名的除外，交给去重比详情）；
+       不通过即丢弃。
+    3. 注册表里没有、但 DeepSeek 生成且通过校验的，才补充进来。
+    4. 标记来源（_src），供去重时判断「撞名时简介该用谁的」。
+    返回 [{name, intro}]（顺序：注册表优先，模型补充的在后）。"""
     month = today_date.month
     day = today_date.day
+    today_term = get_solar_term(today_date)
 
-    result = []
-    seen_names = set()
+    items = []
+    reg_keys = set()
 
     # 1) 注册表节日（权威、优先）
-    reg_list = SOLAR_FESTIVALS.get((month, day), [])
-    for name, intro in reg_list:
-        result.append({"name": name, "intro": intro})
-        seen_names.add(name)
+    for name, intro in SOLAR_FESTIVALS.get((month, day), []):
+        items.append({"name": name, "intro": intro, "_src": "reg"})
+        reg_keys.add(_fest_key(name))
 
-    # 2) DeepSeek 生成节日，做日期校验 + 去重
+    # 2) DeepSeek 生成节日：过滤错误节气 + 日期校验
     for f in deepseek_festivals:
-        name = f.get("name", "").strip()
-        intro = f.get("intro", "").strip()
+        name = (f.get("name") or "").strip()
+        intro = (f.get("intro") or "").strip()
         if not name:
             continue
-        # 与注册表重名 → 跳过（注册表版本更权威，已在上方）
-        if name in seen_names:
+        key = _fest_key(name)
+        if not key:
             continue
-        # 日期校验：简介必须含「X月X日」，且 X月X日 == 今天
-        if not _festival_date_matches(intro, month, day):
+        # 是节气名但不是今天的节气 → 判定为错误，丢弃
+        if key in SOLAR_TERM_NAMES and key != today_term:
             continue
-        result.append({"name": name, "intro": intro})
-        seen_names.add(name)
+        # 与注册表重名：允许进入后续去重（撞名时用模型这份更详细的简介）
+        if key not in reg_keys and not _festival_date_matches(intro, month, day):
+            continue
+        items.append({"name": name, "intro": intro, "_src": "ds"})
 
-    return result
+    return _dedupe_festivals(items)
+
+
+def _norm_fest_name(name):
+    """节日名归一化，用于去重比较。
+    去掉括号/方括号内的补充说明（如「小雪（节气）」→「小雪」），
+    并去掉空格、书名号、引号等标点，统一大小写。"""
+    if not name:
+        return ""
+    s = name.strip()
+    # 去掉圆括号/方括号/中文括号里的内容（可多次出现）
+    s = re.sub(r"[（(【\[][^）)】\]]*[）)】\]]", "", s)
+    # 去掉常见标点与空白
+    s = re.sub(r"[\s·・\.。、《》「」『』\"'’‘“”\-—_/／:：]", "", s)
+    # 去掉结尾的「节气」二字（如「小雪节气」→「小雪」），与节气表名称对齐
+    if s.endswith("节气"):
+        s = s[:-2]
+    return s.lower()
+
+
+# 同一节日的不同叫法 -> 主名（用于跨来源去重）
+FEST_ALIASES = {
+    "上元节": "元宵节", "元宵": "元宵节", "灯节": "元宵节",
+    "七夕": "七夕节", "乞巧节": "七夕节",
+    "盂兰盆节": "中元节",
+    "祭灶节": "小年", "小年节": "小年",
+    "春龙节": "龙抬头", "青龙节": "龙抬头", "二月二": "龙抬头",
+    "老人节": "重阳节", "登高节": "重阳节", "敬老节": "重阳节",
+    "踏青节": "清明", "清明节": "清明",
+    "农历新年": "春节", "新春": "春节",
+    "大年三十": "除夕",
+    "腊八": "腊八节",
+    "冬节": "冬至",
+    "三月三": "上巳节",
+}
+
+
+def _fest_key(name):
+    """去重用的归一化 key：基础归一化 + 别名归并 + 节气变体归并。
+    「清明节/冬至节/立春节」这类「节气名 + 节」统一归到节气名，
+    避免节气表与注册表/DeepSeek 各写一遍导致重复展示。"""
+    k = _norm_fest_name(name)
+    if not k:
+        return ""
+    if k in FEST_ALIASES:
+        return _norm_fest_name(FEST_ALIASES[k])
+    if k.endswith("节") and k[:-1] in SOLAR_TERM_NAMES:
+        return k[:-1]
+    return k
+
+
+def _dedupe_festivals(items):
+    """按 _fest_key 去重（只在真的撞名时生效，不撞名的条目原样保留）：
+    - 名称：保留首次出现的那个，即权威来源（农历/节气/浮动/注册表）的规范叫法，
+      不会出现「小雪」被模型写成「小雪（节气）」这种；
+    - 简介：撞名时优先用 DeepSeek 写的那份（更详细、更像介绍），
+      模型没写或太短（<30 字）时，才退回「更详细者胜出（≥1.2 倍）」的旧规则。"""
+    order = []
+    best = {}
+    for f in items:
+        name = (f.get("name") or "").strip()
+        intro = (f.get("intro") or "").strip()
+        if not name:
+            continue
+        key = _fest_key(name)
+        if not key:
+            continue
+        if key not in best:
+            order.append(key)
+            best[key] = {"name": name, "intro": intro, "_tier": f.get("_tier", 9)}
+        else:
+            old_len = len(best[key].get("intro") or "")
+            if f.get("_src") == "ds" and len(intro) >= 30:
+                # 撞名且这份是 DeepSeek 写的 → 用它的简介，名称仍保持权威叫法
+                best[key]["intro"] = intro
+            elif len(intro) >= old_len * 1.2:
+                # 明显更详细（≥1.2 倍）才替换，避免几乎等长时覆盖已核对的版本
+                best[key]["intro"] = intro
+    return [best[k] for k in order]
+
+
+# 中国官方设立/法定的节日与纪念日（排序层级 2：国家与政治纪念日）
+NATIONAL_FESTIVALS = {
+    "元旦", "国际劳动节", "国际劳动妇女节", "国际儿童节", "国际护士节",
+    "教师节", "记者节", "植树节", "青年节", "建党节", "建军节", "国庆节",
+    "全国消防日", "全国爱眼日", "全国防灾减灾日", "全民国家安全教育日",
+    "中国医师节", "中国人民警察节", "中国农民丰收节", "烈士纪念日",
+    "南京大屠杀死难者国家公祭日", "中国人民抗日战争胜利纪念日",
+    "九一八事变纪念日", "七七事变纪念日", "二七纪念日", "五卅纪念日",
+    "辛亥革命纪念日", "学雷锋纪念日", "香港回归纪念日", "澳门回归纪念日",
+}
+
+
+def _fest_tier(name):
+    """节日重要性层级（越小越靠前）：
+    0 中国传统民俗节日、1 二十四节气、2 国家与政治纪念日、
+    3 国际组织发起的主题日、4 其他（外国节日、宗教节日等）。
+    农历/节气/浮动节日由调用方直接指定层级，这里只判断注册表和模型生成的条目。"""
+    k = _norm_fest_name(name)
+    if not k:
+        return 4
+    if k in NATIONAL_FESTIVALS:
+        return 2
+    if k.startswith(("世界", "国际", "全球", "联合国")):
+        return 3
+    return 4
+
+
+_CN_NUMERALS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                "六": 6, "七": 7, "八": 8, "九": 9}
+_CN_DATE_RE = re.compile(r"([一二三四五六七八九十廿卅]{1,3})月([一二三四五六七八九十廿卅]{1,4})日")
+
+
+def _cn_numeral_to_int(s):
+    """中文数字转整数（覆盖 1~31 的日期场景）：十一→11、二十三→23、三十→30、廿二→22。"""
+    s = (s or "").strip()
+    if not s:
+        return None
+    if s in _CN_NUMERALS:
+        return _CN_NUMERALS[s]
+    if s == "十":
+        return 10
+    if s[0] in ("廿", "卅"):
+        base = 20 if s[0] == "廿" else 30
+        rest = s[1:]
+        return base + (_CN_NUMERALS.get(rest, 0) if rest else 0)
+    if "十" in s:
+        tens, _, ones = s.partition("十")
+        t = _CN_NUMERALS.get(tens, 1) if tens else 1
+        o = _CN_NUMERALS.get(ones, 0) if ones else 0
+        return t * 10 + o
+    return None
+
+
+_CN_DAY_AFTER_SEP_RE = re.compile(r"([—\-–~～至到])\s*([一二三四五六七八九十廿卅]{1,4})日")
+
+
+def _normalize_cn_dates(text):
+    """把「十一月二十二日」这类中文数字日期统一成「11月22日」，
+    区间右端点省略月份时（「十一月二十二日至二十三日」）也一并转换，
+    便于后续按同一套规则做日期校验。转换失败的片段原样保留。"""
+    def _rep(m):
+        mo = _cn_numeral_to_int(m.group(1))
+        d = _cn_numeral_to_int(m.group(2))
+        if mo and d:
+            return "%d月%d日" % (mo, d)
+        return m.group(0)
+
+    text = _CN_DATE_RE.sub(_rep, text)
+
+    def _rep_day(m):
+        d = _cn_numeral_to_int(m.group(2))
+        return m.group(1) + ("%d日" % d if d else m.group(2) + "日")
+
+    return _CN_DAY_AFTER_SEP_RE.sub(_rep_day, text)
+
+
+_DATE_RANGE_RE = re.compile(
+    r"(\d{1,2})\s*月\s*(\d{1,2})\s*日?\s*[—\-–~～至到]\s*(\d{1,2})\s*日"
+)
+
+
+def _explicit_dates(text):
+    """提取简介里「具体到日」的所有日期，返回 [(月, 日), ...]。
+    - 「11月22日」→ (11, 22)
+    - 「11月16日—22日」这类区间：只收两个端点（16 和 22），
+      中间的日子不算 —— 区间写法本身代表跨多天，不能拿它当「就是今天」的依据；
+    - 只有「11月」「11月中旬」「11月下旬」这类没到日的写法，一概不收。"""
+    pairs = []
+    # 先补区间右端点：右端点常省略「月」（11月22日—23日 / 11月22日至23日）
+    for m in _DATE_RANGE_RE.finditer(text):
+        mo, d1, d2 = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        pairs.append((mo, d1))
+        pairs.append((mo, d2))
+    # 再收普通「X月X日」
+    for m in re.finditer(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", text):
+        pairs.append((int(m.group(1)), int(m.group(2))))
+    return pairs
 
 
 def _festival_date_matches(intro, month, day):
-    """从简介文本里提取「X月X日」样式，判断是否等于 (month, day)。
-    提取不到日期信息时，保守起见返回 False（丢弃），避免展示日期错误的节日。"""
+    """判断简介里是否「明确提到今天这一天」。
+    提取简介中所有具体到日的「X月X日」，任意一处等于 (month, day) 即通过；
+    中文数字日期（十一月二十二日）先归一成阿拉伯数字再比对；
+    区间写法（11月22日—23日、11月16日至22日）只认两个端点，中间日期不算；
+    只写了「11月」「11月中旬」这类不到日的表述、或一处日期都没有时返回 False（丢弃），
+    避免展示日期不符的节日。"""
     if not intro:
         return False
-    # 匹配「X月X日」（阿拉伯数字或中文数字），取第一个匹配
-    m = re.search(r"(\d{1,2})月(\d{1,2})日", intro)
-    if not m:
-        # 兼容「十一月二十一日」之类中文数字（简单映射 1-12 月）
-        return False
-    try:
-        fm = int(m.group(1))
-        fd = int(m.group(2))
-    except ValueError:
-        return False
-    return fm == month and fd == day
+    text = _normalize_cn_dates(intro)
+    return (month, day) in _explicit_dates(text)
 
 
 def parse_words(text):
@@ -975,11 +1170,86 @@ SOLAR_TERM_INTRO = {
 
 def get_solar_term_intro(today):
     """返回当天节气 [{name, intro}]（若有）"""
-    term = SOLAR_TERMS.get((today.month, today.day))
+    term = get_solar_term(today)
     if not term:
         return []
     intro = SOLAR_TERM_INTRO.get(term, "")
     return [{"name": term, "intro": intro}]
+
+
+# ============ 节气精确计算（天文算法） ============
+# 上面 SOLAR_TERMS 只是「近似日期」，用于兜底和牛顿迭代的初值。
+# 实际节气每年会漂移 1~2 天（如冬至多在 12 月 21 日，2026 年是 12 月 22 日），
+# 直接用固定日期会出现「该显示时没显示、不该显示时显示」的错位，因此这里按
+# 「太阳视黄经」精确推算当年每个节气的时刻，再换算成北京时间取日期。
+
+# 节气名 -> 太阳视黄经（度），春分为 0°
+SOLAR_TERM_LONGITUDE = {
+    "春分": 0, "清明": 15, "谷雨": 30, "立夏": 45, "小满": 60, "芒种": 75,
+    "夏至": 90, "小暑": 105, "大暑": 120, "立秋": 135, "处暑": 150, "白露": 165,
+    "秋分": 180, "寒露": 195, "霜降": 210, "立冬": 225, "小雪": 240, "大雪": 255,
+    "冬至": 270, "小寒": 285, "大寒": 300, "立春": 315, "雨水": 330, "惊蛰": 345,
+}
+SOLAR_TERM_NAMES = set(SOLAR_TERM_LONGITUDE)
+# 节气名 -> 近似（月, 日），作为迭代初值
+_SOLAR_TERM_APPROX = {name: md for md, name in SOLAR_TERMS.items()}
+_JD_EPOCH = dt.datetime(2000, 1, 1, 12)  # JD 2451545.0 对应 2000-01-01 12:00 UT
+_SOLAR_TERM_CACHE = {}
+
+
+def _sun_apparent_longitude(jd):
+    """儒略日 -> 太阳视黄经（度）。Meeus 简化公式，精度约 0.01°（折算数分钟）。"""
+    t = (jd - 2451545.0) / 36525.0
+    l0 = 280.46646 + 36000.76983 * t + 0.0003032 * t * t
+    m = math.radians(357.52911 + 35999.05029 * t - 0.0001537 * t * t)
+    c = ((1.914602 - 0.004817 * t - 0.000014 * t * t) * math.sin(m)
+         + (0.019993 - 0.000101 * t) * math.sin(2 * m)
+         + 0.000289 * math.sin(3 * m))
+    omega = math.radians(125.04 - 1934.136 * t)
+    return (l0 + c - 0.00569 - 0.00478 * math.sin(omega)) % 360.0
+
+
+def _solar_term_date(year, name):
+    """返回某年某节气在中国标准时间（UTC+8）下的日期。失败返回 None。"""
+    key = (year, name)
+    if key in _SOLAR_TERM_CACHE:
+        return _SOLAR_TERM_CACHE[key]
+    md = _SOLAR_TERM_APPROX.get(name)
+    if not md:
+        return None
+    target = SOLAR_TERM_LONGITUDE[name]
+    try:
+        guess = dt.datetime(year, md[0], md[1])
+        jd = 2451545.0 + (guess - _JD_EPOCH).total_seconds() / 86400.0
+        for _ in range(10):
+            diff = (target - _sun_apparent_longitude(jd) + 180.0) % 360.0 - 180.0
+            if abs(diff) < 1e-7:
+                break
+            jd += diff / 0.98564736
+        d = (_JD_EPOCH + dt.timedelta(days=jd - 2451545.0) + dt.timedelta(hours=8)).date()
+    except Exception:
+        d = dt.date(year, md[0], md[1])  # 计算异常时退回近似日期
+    _SOLAR_TERM_CACHE[key] = d
+    return d
+
+
+def get_solar_term(today):
+    """返回 today 当天的节气名（无则 None）。精确计算，带缓存。"""
+    if not isinstance(today, dt.date):
+        return None
+    computed = False
+    for name in SOLAR_TERM_LONGITUDE:
+        d = _solar_term_date(today.year, name)
+        if d is None:
+            continue
+        computed = True
+        if d == today:
+            return name
+    # 只有在精确计算完全不可用时，才退回固定近似表
+    if not computed:
+        return SOLAR_TERMS.get((today.month, today.day))
+    return None
+
 
 
 # 浮动日期节日（公历）：规则为「某月第 N 个星期几」，日期每年变动，需动态计算。
@@ -1240,6 +1510,9 @@ SOLAR_FESTIVALS = {
         ("世界电视日", "1996 年 12 月 18 日第 51 届联合国大会通过决议，将首届世界电视论坛召开日 11 月 21 日定为世界电视日，强调电视在传播信息与文化中的重要作用。"),
         ("世界渔业日", "1997 年 11 月 21 日，来自 32 个国家的小规模渔业工作者在印度新德里首次聚集，成立「世界渔业论坛」并签署宣言，此后每年 11 月 21 日为世界渔业日，呼吁关注渔业资源可持续发展、反对过度捕捞与非法捕鱼、维护渔民权益。"),
     ],
+    (11, 22): [
+        ("世界针灸日", "2011 年，世界针灸学会联合会（WFAS）将 11 月 22 日定为世界针灸日（其前一周为世界针灸周），旨在推广中医针灸这一传统医学，弘扬针灸在防病治病中的作用；中医针灸已于 2010 年列入联合国教科文组织人类非物质文化遗产代表作名录。"),
+    ],
     (12, 1): [
         ("世界艾滋病日", "1988 年世界卫生组织将 12 月 1 日定为世界艾滋病日，提高公众对艾滋病的认识、反对歧视。"),
     ],
@@ -1402,8 +1675,8 @@ def get_date_info(today):
             parts.append("农历{}月{}".format(ln[3], ln[4]))
     except Exception:
         pass
-    # 节气
-    term = SOLAR_TERMS.get((today.month, today.day))
+    # 节气（精确计算，逐年 1~2 天漂移）
+    term = get_solar_term(today)
     if term:
         parts.append(term)
     return " · ".join(parts)
@@ -1605,17 +1878,23 @@ def main_handler(event, context):
     # 解析当天节日/纪念日：农历传统节日 + 24节气 + 权威注册表优先 + DeepSeek 生成（经日期校验）兜底
     if task_name == "history":
         deepseek_festivals = parse_festivals(content_text)
-        festivals_info = merge_festivals(deepseek_festivals, today_date)
-        # 农历传统节日 + 24 节气排在最前面（春节、中秋、节气等最重要）
-        lunar_fests = get_lunar_festivals(today_date)
-        term_fests = get_solar_term_intro(today_date)
-        float_fests = get_floating_festivals(today_date)
-        # 去重：农历节日/节气/浮动节日若与已有重名则跳过
-        existing = {f["name"] for f in festivals_info}
-        lunar_added = [f for f in lunar_fests if f["name"] not in existing]
-        term_added = [f for f in term_fests if f["name"] not in existing and f["name"] not in {x["name"] for x in lunar_added}]
-        float_added = [f for f in float_fests if f["name"] not in existing and f["name"] not in {x["name"] for x in lunar_added + term_added}]
-        festivals_info = lunar_added + term_added + float_added + festivals_info
+        reg_fests = []
+        for f in merge_festivals(deepseek_festivals, today_date):
+            d = dict(f)
+            d["_tier"] = _fest_tier(d.get("name", ""))
+            reg_fests.append(d)
+        # 各来源带上重要性层级：0 传统民俗 > 1 节气 > 2 国家政治纪念日 > 3 国际主题日 > 4 其他
+        lunar_fests = [dict(f, _tier=0) for f in get_lunar_festivals(today_date)]
+        term_fests = [dict(f, _tier=1) for f in get_solar_term_intro(today_date)]
+        float_fests = [dict(f, _tier=4) for f in get_floating_festivals(today_date)]
+        ordered = lunar_fests + term_fests + float_fests + reg_fests
+        # 归一化去重：只有真的撞名才合并，名字用权威叫法、简介用 DeepSeek 那份
+        fests = _dedupe_festivals(ordered)
+        # 按重要程度从高到低排（稳定排序，同级保持来源顺序），最多展示 4 条
+        fests.sort(key=lambda f: f.get("_tier", 9))
+        festivals_info = [
+            {"name": f["name"], "intro": f["intro"]} for f in fests[:4]
+        ]
     else:
         festivals_info = []
 
