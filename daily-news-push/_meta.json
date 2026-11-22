@@ -5,7 +5,7 @@
   "description_zh": "搭建每日 AI 图文推送：DeepSeek 生成 + Unsplash 配图 + COS 托管网页 + 企业微信推送，云端定时运行，不依赖 PC。",
   "description_en": "Build daily AI news push: DeepSeek + Unsplash images + COS hosting + WeCom webhook, cloud-scheduled, PC-independent.",
   "category": "automation",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "author": "小v",
   "emoji": "📰",
   "color": "#2b6cf6",
