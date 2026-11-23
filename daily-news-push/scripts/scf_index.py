@@ -834,7 +834,7 @@ def get_word_audio_b64(word):
         return "", "audio/mpeg"
 
 
-def build_html(news_items, title, date_str, date_info="", festivals=None):
+def build_html(news_items, title, date_str, date_info="", festivals=None, show_credit=False):
     cards = ""
     for idx, item in enumerate(news_items, 1):
         # 1-3 张图，横向滑动轮播；固定高度 + cover 裁剪，保证尺寸一致
@@ -846,7 +846,8 @@ def build_html(news_items, title, date_str, date_info="", festivals=None):
             dots = []
             for bi, b64 in enumerate(imgs_b64):
                 mt = metas[bi] if bi < len(metas) else {}
-                ctype = (mt.get("ctype") or "image/jpeg").lower()
+                # 只有 AI 新闻按实际图片格式内嵌；其他板块沿用原来的 image/jpeg
+                ctype = (mt.get("ctype") or "image/jpeg").lower() if show_credit else "image/jpeg"
                 if "png" in ctype:
                     ctype = "image/png"
                 elif "webp" in ctype:
@@ -885,12 +886,13 @@ def build_html(news_items, title, date_str, date_info="", festivals=None):
                     .format(slides[0])
                 )
         cards += '<div style="margin-bottom:24px;padding:20px;background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.08)">'
-        # 图源标注（新闻原图属各家媒体，标一下来源）
+        # 图源标注（仅 AI 新闻；历史板块保持原样，不加这行）
         credit = ""
-        for mt in metas:
-            if mt.get("credit"):
-                credit = mt["credit"]
-                break
+        if show_credit:
+            for mt in metas:
+                if mt.get("credit"):
+                    credit = mt["credit"]
+                    break
         credit_html = ""
         if credit:
             credit_html = ('<div style="margin:-8px 0 10px;color:#9aa0a6;font-size:12px;'
@@ -2679,11 +2681,13 @@ def main_handler(event, context):
                 fresh = [c for c in cands if c["id"] not in used_ids]
                 stale = [c for c in cands if c["id"] in used_ids]
                 for cand in fresh + stale:
-                    # 新闻板块：图注和关键词一个实词都不沾就别用，宁可这条没有配图
+                    # 以下两条过滤只对 AI 新闻生效，其他板块（历史/单词）保持原有选图逻辑
                     if task_name == "news" and not _unsplash_matches(cand, ck):
                         continue
                     img_bytes, ctype = download_image(cand["url"])
-                    if not img_bytes or image_texty(img_bytes):
+                    if not img_bytes:
+                        continue
+                    if task_name == "news" and image_texty(img_bytes):
                         continue
                     if _take(img_bytes, cand["id"], "Unsplash", ctype):
                         got = True
@@ -2701,7 +2705,8 @@ def main_handler(event, context):
 
     # 3. 生成 HTML 并上传 COS（历史板块带农历/节日信息）
     page_date_info = date_info if task_name == "history" else ""
-    html = build_html(items, task["title"], today_cn, date_info=page_date_info, festivals=festivals_info)
+    html = build_html(items, task["title"], today_cn, date_info=page_date_info,
+                      festivals=festivals_info, show_credit=(task_name == "news"))
     key = "{}/{}.html".format(task["dir"], today)
     try:
         status, public_url = cos_put_object(
