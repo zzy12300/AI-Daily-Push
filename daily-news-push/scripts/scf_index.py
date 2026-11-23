@@ -1321,6 +1321,10 @@ TASKS = {
             "严格针对 {month}月{day}日 这一天，只列出「确定在这一天」的节日、纪念日、节气"
             "（公历和农历都要考虑）。注意：如果某个节日/纪念日不是 {month}月{day}日，"
             "绝对不要列出来，宁缺毋滥。\n"
+            "特别提醒：不要做任何星期推算，不要写「{month}月{day}日恰逢第几个星期几」"
+            "「因此这一天是…」这类结论。凡是日期要靠「某月第几个星期几」推出来的节日"
+            "（如感恩节、母亲节、父亲节、总统日、马丁·路德·金纪念日、哥伦布日、"
+            "阵亡将士纪念日、美国劳动节、复活节及其相关节日），一律不要输出，这些由程序单独处理。\n"
             "如果 {month}月{day}日 恰好是二十四节气中的某一个，必须把这个节气单独列出来，"
             "而且简介要写详细（80~150 字）：说明它是第几个节气、大致交节时间、"
             "气候与物候特征、对应的农事活动、民间习俗，以及它在中国农耕文化中的意义。\n"
@@ -1430,11 +1434,62 @@ def parse_festivals(text):
     return [f for f in result if f.get("name")]
 
 
+_PLACEHOLDER_FEST_KEYS = {"无", "暂无", "没有", "无节日", "暂无节日", "没有节日",
+                          "none", "null", "无相关节日", "-", "—", "—"}
+
+
+def _is_placeholder_festival(key, intro):
+    """识别模型输出的「占位条目」：当天没有节日时，它可能写成
+    「节日：无 / 简介：经严格核对，当天没有可确证的节日…」，这类内容不能当成节日展示。"""
+    k = (key or "").strip().lower()
+    if k in _PLACEHOLDER_FEST_KEYS or k.startswith("无节日") or k.startswith("没有"):
+        return True
+    text = intro or ""
+    return bool(re.search(r"(没有|无)(?:可确证的?|相关的?|相关的可确证)?(?:全球性|中国)?节日", text))
+
+
+_FEST_NAME_DATES_CACHE = {}
+
+
+def _fest_name_dates(year):
+    """名称（`_fest_key` 归一化后）→ 该年的权威日期集合 {(月, 日)}。
+    来源三处：固定日期注册表、浮动节日（某月第 N 个星期几）、复活节系列（复活节 ± N 天）。
+    用途：模型偶尔把「名字对、日期错」的节日塞进来（例：把 11 月 21 日的世界问候日写到 11 月 23 日），
+    靠名字反查权威日期就能拦住这类错误。"""
+    if year in _FEST_NAME_DATES_CACHE:
+        return _FEST_NAME_DATES_CACHE[year]
+    idx = {}
+
+    def add(name, mo, dy):
+        k = _fest_key(name)
+        if k and mo and dy:
+            idx.setdefault(k, set()).add((mo, dy))
+
+    for (mo, dy), lst in SOLAR_FESTIVALS.items():
+        for name, _intro in lst:
+            add(name, mo, dy)
+    for name, _intro, mo, nth, wd in FLOATING_FESTIVALS:
+        d = _nth_weekday(year, mo, nth, wd)
+        if d:
+            add(name, d.month, d.day)
+    try:
+        easter = _easter_date(year)
+        for name, _intro, off in EASTER_RELATED:
+            d = easter + dt.timedelta(days=off)
+            add(name, d.month, d.day)
+    except Exception:
+        pass
+    _FEST_NAME_DATES_CACHE[year] = idx
+    return idx
+
+
 def merge_festivals(deepseek_festivals, today_date):
     """合并节日来源，保证准确：
     1. 先取「权威注册表」里当天（月,日）的节日（名称 + 简介），这些 100% 准确、优先采用。
     2. DeepSeek 生成的节日，逐个做校验：
        - 名字归一化后若是「节气」，必须等于今天的实际节气（防止把别的节气说成今天）；
+       - 简介里若用「某月第几个星期几」这类规则来证明「今天就是它」，用同样的算法验算，
+         算出的日期不是今天就判定为模型算错（如把 2026-11-23 当成 11 月的第四个星期四）；
        - 简介里必须能提取到「X月X日」且等于今天（与注册表重名的除外，交给去重比详情）；
        不通过即丢弃。
     3. 注册表里没有、但 DeepSeek 生成且通过校验的，才补充进来。
@@ -1452,7 +1507,7 @@ def merge_festivals(deepseek_festivals, today_date):
         items.append({"name": name, "intro": intro, "_src": "reg"})
         reg_keys.add(_fest_key(name))
 
-    # 2) DeepSeek 生成节日：过滤错误节气 + 日期校验
+    # 2) DeepSeek 生成节日：过滤占位/错误节气/星期规则/日期校验
     for f in deepseek_festivals:
         name = (f.get("name") or "").strip()
         intro = (f.get("intro") or "").strip()
@@ -1461,8 +1516,18 @@ def merge_festivals(deepseek_festivals, today_date):
         key = _fest_key(name)
         if not key:
             continue
+        # 模型有时会输出「节日：无 / 简介：经核对当天没有节日」这种占位条目，直接丢弃
+        if _is_placeholder_festival(key, intro):
+            continue
         # 是节气名但不是今天的节气 → 判定为错误，丢弃
         if key in SOLAR_TERM_NAMES and key != today_term:
+            continue
+        # 名称在权威来源里存在、但权威日期不是今天 → 模型把节日挪到了别的日期，丢弃
+        known_dates = _fest_name_dates(today_date.year).get(key)
+        if known_dates and (month, day) not in known_dates:
+            continue
+        # 简介里的「某月第几个星期几」算出来不是今天 → 模型把星期算错了（如 11-23 当成感恩节），丢弃
+        if _rule_date_conflict(intro, today_date):
             continue
         # 与注册表重名：允许进入后续去重（撞名时用模型这份更详细的简介）
         if key not in reg_keys and not _festival_date_matches(intro, month, day):
@@ -1660,6 +1725,72 @@ def _festival_date_matches(intro, month, day):
         return False
     text = _normalize_cn_dates(intro)
     return (month, day) in _explicit_dates(text)
+
+
+# 星期/序数文字 → 数字（星期与 _nth_weekday 保持一致：0=周一 ... 6=周日）
+_WEEKDAY_CHARS = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6,
+                  "1": 0, "2": 1, "3": 2, "4": 3, "5": 4, "6": 5, "7": 6}
+_NTH_CHARS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+              "1": 1, "2": 2, "3": 3, "4": 4, "5": 5}
+_CN_MONTHS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+              "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12}
+
+# 「11 月的第四个星期四」/「5月第二个星期日」
+_RULE_NTH_RE = re.compile(
+    r"(\d{1,2})\s*月\s*(?:的)?\s*第\s*([一二三四五1-5])\s*个?\s*(?:星期|周|礼拜)\s*([一二三四五六日天1-7])")
+# 「11 月的最后一个星期一」
+_RULE_LAST_RE = re.compile(
+    r"(\d{1,2})\s*月\s*(?:的)?\s*(?:最后(?:一个)?|末个?)\s*(?:星期|周|礼拜)\s*([一二三四五六日天1-7])")
+
+
+def _cn_month_to_digits(text):
+    """「十一月」→「11月」，便于规则正则统一按阿拉伯数字解析"""
+    return re.sub(r"(十二|十一|[一二三四五六七八九十])\s*月",
+                  lambda m: "{}月".format(_CN_MONTHS.get(m.group(1), m.group(1))), text)
+
+
+def _rule_dates_in_text(text, year):
+    """抽出文本里「X月第N个星期D」「X月最后一个星期D」这类日期规则，并算出当年的真实日期。
+    返回 [(月, 序数, 星期, date, 原文片段)]。
+    「第一个星期一之后的星期二」这种把前者当锚点的写法跳过，避免把锚点当成节日日期。"""
+    out = []
+    for m in _RULE_NTH_RE.finditer(text):
+        tail = text[m.end():m.end() + 4]
+        if "后" in tail or "次" in tail:
+            continue   # 后面那个星期X 才是目标日期，这个只是参照
+        mo, nth, wd = int(m.group(1)), _NTH_CHARS.get(m.group(2)), _WEEKDAY_CHARS.get(m.group(3))
+        if not (1 <= mo <= 12) or nth is None or wd is None:
+            continue
+        d = _nth_weekday(year, mo, nth, wd)
+        if d:
+            out.append((mo, nth, wd, d, m.group(0)))
+    for m in _RULE_LAST_RE.finditer(text):
+        mo, wd = int(m.group(1)), _WEEKDAY_CHARS.get(m.group(2))
+        if not (1 <= mo <= 12) or wd is None:
+            continue
+        d = _nth_weekday(year, mo, 0, wd)
+        if d:
+            out.append((mo, 0, wd, d, m.group(0)))
+    return out
+
+
+def _rule_date_conflict(intro, today_date):
+    """方案B（兜底）：简介用「某月第几个星期几」来证明「今天就是它」，
+    但这条规则算出来的日期并不是今天 —— 说明模型把星期算错了
+    （例如把 2026-11-23 当成 11 月的第四个星期四，实际是 11-26），判定为错误节日。
+
+    只要有一处规则算出的日期正好是今天，就认为简介成立；没有规则表述或算不出日期的，
+    不参与判断（交给原有的「X月X日」校验）。"""
+    if not intro:
+        return False
+    text = _cn_month_to_digits(intro)
+    hits = _rule_dates_in_text(text, today_date.year)
+    if not hits:
+        return False
+    for _mo, _nth, _wd, d, _raw in hits:
+        if (d.month, d.day) == (today_date.month, today_date.day):
+            return False
+    return True
 
 
 def parse_words(text):
