@@ -10,7 +10,7 @@ description: >-
 description_zh: "搭建每日 AI 图文推送：DeepSeek 生成 + Unsplash 配图 + COS 托管网页 + 企业微信推送，云端定时运行，不依赖 PC。含 AI 新闻、英语单词（发音+词库）、历史上的今天三板块。"
 description_en: "Build daily AI news push: DeepSeek + Unsplash images + COS hosting + WeCom webhook, cloud-scheduled, PC-independent. Three boards: AI news, English words (audio+vocabulary bank), today in history."
 category: automation
-version: "1.3.0"
+version: "1.3.1"
 author: "小v"
 disable-model-invocation: false
 user-invocable: true
@@ -29,7 +29,7 @@ agent_created: true
 ## 架构
 
 ```
-腾讯云函数 SCF (定时触发器 09:00/12:30/15:30)
+腾讯云函数 SCF (定时触发器 20:00/12:30/15:30)
   └─> DeepSeek 生成文字内容
   └─> 三个板块差异化：
       ├─ AI 新闻：3条×150字，每条 Unsplash 配图
@@ -45,9 +45,32 @@ agent_created: true
 
 | 板块 | task | 内容 | 配图 | 特色 |
 |---|---|---|---|---|
-| AI 新闻 | news | 3条×150字 | 每条1张图 | 标题列表摘要 |
+| AI 新闻 | news | 最多3条×150字 | 每条1张图（Unsplash，跨天避开重复） | 正文基于**当天真实报道**改写（量子位 + Solidot RSS），不是让模型凭空编 |
 | 英语单词 | words | 3个单词 | 无 | 例句+例句翻译+发音+词库 |
-| 历史上的今天 | history | 最多3条×300字 | 每条0-1张图 | 按影响力排序+节日简介+农历/节气 |
+| 历史上的今天 | history | 最多3条×300字 | 每条1张图（Wikimedia 优先） | 按影响力排序+节日简介+农历/节气 |
+
+## 新闻板块怎么保证是「今天的」新闻
+
+DeepSeek 没有联网能力，只让它「写今天的新闻」必然编造。做法是**先抓素材、再改写**：
+
+1. `NEWS_FEEDS` 抓当天发布的 RSS：量子位（AI 垂直）+ Solidot（科技，按 `NEWS_AI_KEYWORDS` 过滤 AI 相关）。
+2. `get_today_news_materials()` 只收 `pubDate` 换算成北京时间后**等于今天**的条目，最多 6 条，作为 prompt 里的「唯一事实来源」。
+3. prompt 硬约束：只能写素材里的事件、不得补充素材外的事实、素材不足 3 条就有几条写几条、标题必须具体。
+4. 一条素材都没抓到时不编造，直接输出「今日暂无可靠 AI 快讯」单条。
+5. 诊断入口：`{"task":"probe"}` 返回每个源是否可达、条目数、最新日期、当天条数，不生成不推送。
+
+> 云函数在 ap-shanghai 实测可达 `qbitai.com/feed` 与 `solidot.org/index.rss`。
+
+## 配图跨天去重
+
+Unsplash 按同一关键词搜索，头部结果几天内基本不变，所以「每天配同一张图」的根因是搜索结果稳定 + 只在单次运行内去重。
+
+做法：把用过的图片 id 持久化到 COS `images/used_images.json`（最多 400 条，`IMAGE_HISTORY_KEY` / `IMAGE_HISTORY_MAX`）。
+
+- Unsplash 一次取 12 个候选（`get_unsplash_image_urls`，id 用 photo id），优先挑**没出现过**的；
+- Wikimedia 候选按 `_img_id_for_url()` 归一成稳定 id（剥掉缩略图尺寸段）后同样优先挑没用过的；
+- 全部候选都用过时才回退到旧图，保证「必有图」不被破坏；
+- 本次新用到的 id 在推送前写回 COS，供后面几天继续避开。
 
 ## 核心文件
 
@@ -84,7 +107,7 @@ agent_created: true
 
 | 任务 | 时间 | Cron | 附加信息 |
 |---|---|---|---|
-| AI 新闻 | 09:00 | `0 0 9 * * * *` | `{"task":"news"}` |
+| AI 新闻 | 20:00 | `0 0 20 * * * *` | `{"task":"news"}` |
 | 英语单词 | 12:30 | `0 30 12 * * * *` | `{"task":"words"}` |
 | 历史 | 15:30 | `0 30 15 * * * *` | `{"task":"history"}` |
 

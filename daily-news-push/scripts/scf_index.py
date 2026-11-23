@@ -36,6 +36,150 @@ UNSPLASH_SEARCH_URL = "https://api.unsplash.com/search/photos"
 # 单词词库：存在 COS 上的 JSON，记录所有已推送过的单词，避免重复
 WORD_BANK_KEY = "words/word_bank.json"
 
+# 已用过的配图记录（跨天去重，避免每天配同一张图）
+IMAGE_HISTORY_KEY = "images/used_images.json"
+IMAGE_HISTORY_MAX = 400   # 只保留最近 400 张的 id，防止文件无限增长
+
+
+# ============ 今日新闻素材（RSS） ============
+# DeepSeek 没有联网能力，只靠 prompt 让它「写今天的新闻」必然是编的。
+# 所以先抓当天真实发布的报道标题+摘要作为素材，模型只允许基于素材改写。
+NEWS_FEEDS = [
+    "https://www.qbitai.com/feed",       # 量子位（AI 垂直）
+    "https://www.solidot.org/index.rss", # Solidot（科技，含 AI）
+]
+NEWS_AI_KEYWORDS = (
+    "AI", "A.I.", "人工智能", "大模型", "模型", "GPT", "ChatGPT", "Claude", "Gemini",
+    "DeepSeek", "通义", "文心", "豆包", "Kimi", "智谱", "Llama", "OpenAI", "Anthropic",
+    "英伟达", "NVIDIA", "算力", "GPU", "智能体", "Agent", "多模态", "具身智能", "机器人",
+    "机器学习", "深度学习", "神经网络", "AGI", "推理", "训练",
+)
+
+
+def _strip_html(s):
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    s = s.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    s = s.replace("&#8217;", "'").replace("&quot;", '"')
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _parse_rss_items(xml_text):
+    """解析 RSS 2.0，返回 [{title, summary, pub, link}]。用正则而非 XML 解析，
+    避免个别源的非法字符/命名空间导致整个解析失败。"""
+    items = []
+    for raw in re.findall(r"<item[\s>].*?</item>", xml_text, re.S):
+        def pick(tag):
+            m = re.search(r"<%s[^>]*>(.*?)</%s>" % (tag, tag), raw, re.S)
+            if not m:
+                return ""
+            v = m.group(1).strip()
+            v = re.sub(r"^<!\[CDATA\[(.*?)\]\]>$", r"\1", v, flags=re.S)
+            return _strip_html(v)
+        title = pick("title")
+        if not title:
+            continue
+        items.append({
+            "title": title,
+            "summary": pick("description")[:220],
+            "pub": pick("pubDate"),
+            "link": pick("link"),
+        })
+    return items
+
+
+def _pub_to_bj_date(pub):
+    """RSS 的 pubDate 转北京时间的 date；解析失败返回 None。"""
+    if not pub:
+        return None
+    for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z",
+                "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
+        try:
+            t = dt.datetime.strptime(pub.strip(), fmt)
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=dt.timezone.utc)
+            return t.astimezone(dt.timezone(dt.timedelta(hours=8))).date()
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_rss(url, timeout=10):
+    """抓 RSS 文本，失败返回 None（网络异常不抛，交给上层降级）"""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", "ignore")
+    except Exception:
+        return None
+
+
+def probe_news_feeds(today_date):
+    """诊断用：逐个新闻源报告是否可达、条目数、最新一条的日期"""
+    out = []
+    for url in NEWS_FEEDS:
+        xml_text = _fetch_rss(url)
+        if not xml_text:
+            out.append({"feed": url, "ok": False, "items": 0, "latest": "", "today_items": 0})
+            continue
+        its = _parse_rss_items(xml_text)
+        dates = [_pub_to_bj_date(it["pub"]) for it in its]
+        dates = [d for d in dates if d]
+        out.append({
+            "feed": url,
+            "ok": True,
+            "items": len(its),
+            "latest": str(max(dates)) if dates else "",
+            "today_items": sum(1 for d in dates if d == today_date),
+        })
+    return out
+
+
+def get_today_news_materials(today_date, limit=6):
+    """抓取「今天（北京时间）发布」的 AI 相关报道，返回素材列表。
+    只收发文日期等于 today_date 的条目；一条都没抓到就返回 []，
+    由 prompt 告知模型「没有素材就别写」，绝不让它凭空编今天的新闻。"""
+    got = []
+    for url in NEWS_FEEDS:
+        xml_text = _fetch_rss(url)
+        if not xml_text:
+            continue
+        for it in _parse_rss_items(xml_text):
+            if _pub_to_bj_date(it["pub"]) != today_date:
+                continue
+            blob = it["title"] + " " + it["summary"]
+            if not any(k.lower() in blob.lower() for k in NEWS_AI_KEYWORDS):
+                continue
+            got.append(it)
+    # 去重（同名标题）并限制条数
+    seen, out = set(), []
+    for it in got:
+        key = _norm_title(it["title"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out[:limit]
+
+
+def _norm_title(t):
+    return re.sub(r"[\s，。！？、：:；;,.!?\"'“”‘’（）()【】\[\]—-]", "", t or "").lower()
+
+
+def format_news_material(materials, today_cn):
+    """把素材排版进 prompt。"""
+    if not materials:
+        return ("【今日素材】没有获取到「{}」当天由媒体发布的可靠报道。"
+                "此时**不要编造新闻**，只输出下面这一条即可：\n"
+                "1. 今日暂无可靠 AI 快讯\n"
+                "受新闻源更新延迟影响，今天暂未取到媒体已发布的 AI 新闻，"
+                "建议晚间稍后再查看，或直接访问量子位、机器之心等媒体的当日更新。\n"
+                .format(today_cn))
+    lines = ["【今日素材】（以下均为「{}」当天由媒体发布的报道，是本次写作的**唯一**事实来源）"
+             .format(today_cn)]
+    for i, it in enumerate(materials, 1):
+        lines.append("{}. 标题：{}\n   摘要：{}".format(i, it["title"], it["summary"] or "（无摘要）"))
+    return "\n".join(lines)
+
 
 # ============ DeepSeek ============
 def call_deepseek(api_key, prompt):
@@ -200,6 +344,45 @@ def save_word_bank(secret_id, secret_key, bucket, region, bank):
                    data, "application/json")
 
 
+def load_image_history(secret_id, secret_key, bucket, region):
+    """读取「最近用过的配图」记录，返回 (set(ids), list(ids))。
+    用于跨天去重：同一个关键词每天都搜到同一张图，是图片重复的根因。"""
+    try:
+        raw = cos_get_object(secret_id, secret_key, bucket, region, IMAGE_HISTORY_KEY)
+        if raw:
+            data = json.loads(raw.decode("utf-8"))
+            ids = [str(i) for i in data.get("ids", []) if i]
+            return set(ids), ids
+    except Exception:
+        pass
+    return set(), []
+
+
+def save_image_history(secret_id, secret_key, bucket, region, ids):
+    """写回配图记录（只留最近 IMAGE_HISTORY_MAX 个）"""
+    try:
+        data = json.dumps({"ids": list(ids)[-IMAGE_HISTORY_MAX:]},
+                          ensure_ascii=False).encode("utf-8")
+        cos_put_object(secret_id, secret_key, bucket, region, IMAGE_HISTORY_KEY,
+                       data, "application/json")
+    except Exception:
+        pass
+
+
+def _img_id_for_url(url):
+    """把图片 URL 归一成一个稳定 id（Wikimedia 缩略图 URL 带尺寸参数，先剥掉）"""
+    if not url:
+        return ""
+    base = url.split("?")[0]
+    # Wikimedia 缩略图形如 .../thumb/a/ab/File.jpg/800px-File.jpg → 去掉末段尺寸
+    m = re.search(r"/thumb/(.+?)/\d+px-", base)
+    if m:
+        base = "wikimedia:" + m.group(1)
+    else:
+        base = "url:" + base
+    return base
+
+
 def get_wikimedia_image_urls(keyword, limit=3):
     """用 Wikimedia Commons API 搜历史图片/照片，返回最多 limit 张可直接下载的缩略图 URL 列表
     历史照片优先用这个源（Unsplash 无历史档案图）。一次请求返回多张候选，减少重复调用。"""
@@ -245,26 +428,35 @@ def get_wikimedia_image_urls(keyword, limit=3):
 
 def get_unsplash_image_url(access_key, keyword, offset=0):
     """用 Unsplash 官方搜索 API 按关键词返回一张图 URL，按相关度排序保证强相关"""
+    urls = get_unsplash_image_urls(access_key, keyword, count=1, page=1 + offset)
+    return urls[0]["url"] if urls else ""
+
+
+def get_unsplash_image_urls(access_key, keyword, count=10, page=1):
+    """按关键词返回若干候选图 [{id, url}]，用于「换一张没用过的图」。
+    id 取 Unsplash 的 photo id，便于跨天去重。"""
     params = urllib.parse.urlencode({
         "query": keyword,
-        "per_page": 1,
-        "page": 1 + offset,  # offset 递增换图，避免多条命中同一张
+        "per_page": max(1, min(count, 30)),
+        "page": page,
         "orientation": "landscape",
-        "order_by": "relevant",  # 相关度优先，保证图片与事件强相关
+        "order_by": "relevant",  # 相关度优先，保证图片与内容强相关
     })
     url = "{}?{}".format(UNSPLASH_SEARCH_URL, params)
+    out = []
     try:
         req = urllib.request.Request(
             url, headers={"Authorization": "Client-ID " + access_key}
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        results = data.get("results", [])
-        if results:
-            return results[0]["urls"]["regular"]
+        for r in data.get("results", []):
+            u = (r.get("urls") or {}).get("regular")
+            if u:
+                out.append({"id": "unsplash:" + str(r.get("id", u)), "url": u})
     except Exception:
         pass
-    return ""
+    return out
 
 
 def download_image(url):
@@ -682,12 +874,24 @@ TASKS = {
         "dir": "news",
         "default_kw": "artificial intelligence",
         "prompt": (
-            "你是科技资讯编辑。请生成今天的 3 条 AI 领域重要新闻，"
-            "每条包括一个小标题和约 150 字的详细介绍，总计约 500 字。"
-            "格式严格如下（每条一行标题、一段详情）：\n"
-            "1. 标题\n标题的详细内容介绍。\n"
-            "2. 标题\n详细内容。\n"
-            "3. 标题\n详细内容。\n"
+            "你是科技资讯编辑。今天是 {date_cn}。\n"
+            "{news_material}\n"
+            "请从上面的素材里挑出最多 3 条最重要的 AI 新闻（优先大模型/产品发布/融资并购/"
+            "芯片算力/重要研究），改写成中文快讯，每条一个具体小标题 + 约 150 字介绍。\n"
+            "硬性要求：\n"
+            "1. 只能写素材里出现的事件，不得补充素材之外的事实、数字、人名或公司动态，也不得张冠李戴。\n"
+            "2. 只写发生在今天（{date_cn}，近 24 小时内）的事；素材里明显是往期旧闻的，跳过它。\n"
+            "3. 素材不够 3 条时，有几条写几条，宁可只发 1-2 条，也绝不编造凑数。\n"
+            "4. 标题必须具体：写清是哪家公司/哪个模型/什么产品做了什么事，"
+            "不要用「AI 领域再获突破」这类空泛表述。\n"
+            "5. 每条详情后面单独加一行英文配图关键词，格式「关键词：xxx」，"
+            "用 2-4 个英文单词指向该新闻的具体主体（公司名/模型名/产品名），"
+            "例如 关键词：nvidia data center gpu、关键词：deepseek open source model，"
+            "不要用 AI、technology 这类宽泛词。\n"
+            "格式严格如下（每条三行：标题、详情、关键词）：\n"
+            "1. 标题\n标题的详细内容介绍。\n关键词：nvidia data center gpu\n"
+            "2. 标题\n详细内容。\n关键词：...\n"
+            "3. 标题\n详细内容。\n关键词：...\n"
             "直接输出，不要额外说明。"
         ),
     },
@@ -768,12 +972,15 @@ def parse_news(text, default_title="今日 AI 新闻"):
             break
         if line[:1].isdigit() and len(line) > 1 and line[1] in ".、)）":
             title = line[2:].strip()
-            if "：" in title:
-                title, detail = title.split("：", 1)
-            elif ":" in title:
-                title, detail = title.split(":", 1)
-            else:
-                detail = ""
+            # 只有「标题：一大段正文」这种单行写法才拆开；标题里自带冒号
+            # （如「国产端侧大模型实测：1450亿参数塞进笔记本」）要原样保留
+            detail = ""
+            for sep in ("：", ":"):
+                if sep in title:
+                    head, tail = title.split(sep, 1)
+                    if len(tail.strip()) >= 40:
+                        title, detail = head.strip(), tail.strip()
+                    break
             current = {"title": title, "detail": detail, "img_kw": "", "img_kws": []}
             items.append(current)
         elif line.startswith("#"):
@@ -1709,12 +1916,16 @@ def _resolve_task_name(event):
             t = c.get("task")
             if t and str(t).strip() in TASKS:
                 return str(t).strip()
+            if t and str(t).strip() == "probe":
+                return "probe"
         elif isinstance(c, str):
             s = c.strip()
             if not s:
                 continue
             if s in TASKS:
                 return s
+            if s == "probe":
+                return "probe"
             try:
                 obj = json.loads(s)
                 if isinstance(obj, dict):
@@ -1754,13 +1965,34 @@ def main_handler(event, context):
 
     # 0. 确定任务（兼容定时触发器/控制台测试/纯字符串三种事件格式）
     task_name = _resolve_task_name(event)
+
+    # 诊断分支：{"task":"probe"} 只探测新闻源是否可达 + 当天素材条数，不生成、不推送
+    if task_name == "probe":
+        mats = get_today_news_materials(today_date)
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "today": today,
+            "materials": len(mats),
+            "titles": [it["title"] for it in mats],
+            "feeds": probe_news_feeds(today_date),
+        }
+
     task = TASKS[task_name]
 
     # 1. 生成内容（替换 prompt 中的日期占位符）
+    #    新闻板块：先抓当天真实报道做素材，模型只允许基于素材改写，避免编造「今天的新闻」
+    if task_name == "news":
+        materials = get_today_news_materials(today_date)
+        news_material = format_news_material(materials, today_cn)
+    else:
+        materials = []
+        news_material = ""
     prompt = task["prompt"].format(
         date_cn=today_cn,
         month=today_date.month,
         day=today_date.day,
+        news_material=news_material,
     )
     try:
         content_text = call_deepseek(api_key, prompt)
@@ -1901,8 +2133,13 @@ def main_handler(event, context):
     # 2. 每条必搜 1 张图（多级兜底，保证一定有图）：
     #    历史板块：Wikimedia 历史照片(强相关) → Unsplash 精准词 → Unsplash 标题词 → Unsplash 默认词
     #    非历史板块：Unsplash 精准词 → 标题词 → 默认词
+    #    跨天去重：Unsplash 按关键词搜到的头部结果每天几乎一样，所以把用过的图 id
+    #    记在 COS（images/used_images.json），本次优先挑「没出现过」的候选。
     unsplash_key = os.getenv("UNSPLASH_ACCESS_KEY", "")
-    used_md5 = set()  # 已用图片的 MD5，用于去重
+    used_md5 = set()  # 本次运行内已用图片的 MD5，避免三条新闻撞同一张
+    used_ids, history_ids = load_image_history(secret_id, secret_key, bucket, region)
+    new_ids = []
+
     for i, item in enumerate(items):
         item["imgs_b64"] = []
         kws = item.get("img_kws") or []
@@ -1916,8 +2153,7 @@ def main_handler(event, context):
         title_kw = item.get("title", "").strip()
         if title_kw:
             # 去掉类似「1783年 」的前缀，保留事件名
-            import re as _re
-            m = _re.match(r"^\d{3,4}年\s*(.*)$", title_kw)
+            m = re.match(r"^\d{3,4}年\s*(.*)$", title_kw)
             if m:
                 title_kw = m.group(1).strip()
             if title_kw and title_kw not in cand_kws:
@@ -1925,44 +2161,54 @@ def main_handler(event, context):
         if task.get("default_kw") and task["default_kw"] not in cand_kws:
             cand_kws.append(task["default_kw"])
 
+        def _take(img_bytes, img_id):
+            """下载成功且未被用过就收下这张图"""
+            md5 = hashlib.md5(img_bytes).hexdigest()
+            if md5 in used_md5:
+                return False
+            used_md5.add(md5)
+            used_ids.add(img_id)
+            new_ids.append(img_id)
+            item["imgs_b64"].append(base64.b64encode(img_bytes).decode("ascii"))
+            return True
+
         # 逐级尝试搜图，直到拿到一张成功下载且不重复的图
-        src = ""
         got = False
         for ck in cand_kws:
             if got:
                 break
             # 历史板块：每个关键词都先试 Wikimedia，再试 Unsplash
             if task_name == "history":
-                urls = get_wikimedia_image_urls(ck, limit=3)
-                for u in urls:
+                urls = get_wikimedia_image_urls(ck, limit=6)
+                # 先用没出现过的，实在都出现过再用旧的（保证必有图）
+                ordered_urls = [u for u in urls if _img_id_for_url(u) not in used_ids] + \
+                               [u for u in urls if _img_id_for_url(u) in used_ids]
+                for u in ordered_urls:
                     img_bytes, ctype = download_image(u)
                     if not img_bytes:
                         continue
-                    md5 = hashlib.md5(img_bytes).hexdigest()
-                    if md5 in used_md5:
-                        continue
-                    used_md5.add(md5)
-                    item["imgs_b64"].append(base64.b64encode(img_bytes).decode("ascii"))
-                    got = True
-                    break
+                    if _take(img_bytes, _img_id_for_url(u)):
+                        got = True
+                        break
             if got:
                 break
-            # Unsplash（历史回退 / 非历史）
+            # Unsplash（历史回退 / 非历史）：一次拿一批候选，优先挑没用过的
             if unsplash_key:
-                for attempt in range(3):
-                    src = get_unsplash_image_url(unsplash_key, ck, offset=attempt)
-                    if not src:
-                        break
-                    img_bytes, ctype = download_image(src)
+                cands = get_unsplash_image_urls(unsplash_key, ck, count=12)
+                fresh = [c for c in cands if c["id"] not in used_ids]
+                stale = [c for c in cands if c["id"] in used_ids]
+                for cand in fresh + stale:
+                    img_bytes, ctype = download_image(cand["url"])
                     if not img_bytes:
                         continue
-                    md5 = hashlib.md5(img_bytes).hexdigest()
-                    if md5 in used_md5:
-                        continue
-                    used_md5.add(md5)
-                    item["imgs_b64"].append(base64.b64encode(img_bytes).decode("ascii"))
-                    got = True
-                    break
+                    if _take(img_bytes, cand["id"]):
+                        got = True
+                        break
+
+    # 记录本次用过的图 id，供以后几天继续避开（失败不影响推送）
+    if new_ids:
+        merged = list(history_ids) + [i for i in new_ids if i not in set(history_ids)]
+        save_image_history(secret_id, secret_key, bucket, region, merged)
 
     # 3. 生成 HTML 并上传 COS（历史板块带农历/节日信息）
     page_date_info = date_info if task_name == "history" else ""
