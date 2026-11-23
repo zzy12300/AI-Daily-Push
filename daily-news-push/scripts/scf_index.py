@@ -14,9 +14,12 @@
     COS_REGION          COS 地域（如 ap-shanghai）
 """
 import base64
+import concurrent.futures
 import datetime as dt
 import hashlib
 import hmac
+import html as html_lib
+import io
 import json
 import math
 import os
@@ -25,6 +28,17 @@ import re
 import time
 import urllib.parse
 import urllib.request
+
+# 可选依赖：用来判断配图是不是「文字/界面截图」。
+# 部署时把 Pillow 的 cp37 manylinux wheel 解到函数目录即可（见 scripts/build_zip.py）；
+# 没有 Pillow 时该判断自动跳过（放行原图），不影响推送。
+try:
+    from PIL import Image as _PILImage, ImageFilter as _PILFilter
+    _HAS_PIL = True
+except Exception:
+    _PILImage = None
+    _PILFilter = None
+    _HAS_PIL = False
 
 # ============ 配置 ============
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
@@ -40,6 +54,11 @@ WORD_BANK_KEY = "words/word_bank.json"
 IMAGE_HISTORY_KEY = "images/used_images.json"
 IMAGE_HISTORY_MAX = 400   # 只保留最近 400 张的 id，防止文件无限增长
 
+# 新闻原图：优先用报道自己的头图（与内容强相关、跨天几乎不会重复），
+# 拿不到才降级到 Unsplash。整段抓图/下载共用这个预算（秒），超时就跳过。
+NEWS_IMG_BUDGET = 60
+IMAGE_MAX_BYTES = 2500 * 1024   # 单张图上限，太大直接放弃（base64 内嵌会撑爆页面）
+
 
 # ============ 今日新闻素材（RSS） ============
 # DeepSeek 没有联网能力，只靠 prompt 让它「写今天的新闻」必然是编的。
@@ -48,6 +67,12 @@ NEWS_FEEDS = [
     "https://www.qbitai.com/feed",       # 量子位（AI 垂直）
     "https://www.solidot.org/index.rss", # Solidot（科技，含 AI）
 ]
+
+# 媒体名：用于「图源：量子位」这种标注，取不到就退回域名
+NEWS_SOURCE_NAMES = {
+    "qbitai.com": "量子位",
+    "solidot.org": "Solidot",
+}
 NEWS_AI_KEYWORDS = (
     "AI", "A.I.", "人工智能", "大模型", "模型", "GPT", "ChatGPT", "Claude", "Gemini",
     "DeepSeek", "通义", "文心", "豆包", "Kimi", "智谱", "Llama", "OpenAI", "Anthropic",
@@ -63,10 +88,98 @@ def _strip_html(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
-def _parse_rss_items(xml_text):
-    """解析 RSS 2.0，返回 [{title, summary, pub, link}]。用正则而非 XML 解析，
+def _source_name(feed_url):
+    """新闻源 → 媒体名（用于图源标注），匹配不到就用域名"""
+    for dom, name in NEWS_SOURCE_NAMES.items():
+        if dom in (feed_url or ""):
+            return name
+    try:
+        return urllib.parse.urlparse(feed_url or "").netloc
+    except Exception:
+        return ""
+
+
+_BAD_IMG_HINTS = ("logo", "avatar", "icon", "placeholder", "spacer", "blank",
+                  "qrcode", "qrcode_", "default.jpg", "default.png")
+
+
+def _looks_like_image_url(url):
+    """排除 data URI、svg/ico 图标、站点 logo/头像/占位图"""
+    if not url or len(url) > 1000:
+        return False
+    u = url.strip().lower()
+    if u.startswith("data:"):
+        return False
+    if any(h in u for h in _BAD_IMG_HINTS):
+        return False
+    path = u.split("?")[0]
+    return not path.endswith((".svg", ".ico"))
+
+
+def _extract_images(markup, base_url="", limit=4):
+    """从一段 HTML 里按顺序取前 limit 张正文图（兼容懒加载属性），返回绝对地址列表"""
+    out = []
+    if not markup:
+        return out
+    for m in re.finditer(r"<img\b[^>]*>", markup, re.I):
+        tag = m.group(0)
+        src = ""
+        for attr in ("data-src", "data-original", "data-lazy-src", "src"):
+            am = re.search(attr + r"""\s*=\s*["']([^"']+)["']""", tag, re.I)
+            if am:
+                src = html_lib.unescape(am.group(1).strip())
+                break
+        if not src or not _looks_like_image_url(src):
+            continue
+        wm = re.search(r"""\bwidth\s*=\s*["']?(\d+)""", tag, re.I)
+        if wm and int(wm.group(1)) < 300:   # 太窄的多是图标/表情
+            continue
+        try:
+            u = urllib.parse.urljoin(base_url or "", src)
+        except Exception:
+            continue
+        if u not in out:
+            out.append(u)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _extract_first_img(markup, base_url=""):
+    """从一段 HTML 里取第一张正文图，返回绝对地址；取不到返回空串"""
+    imgs = _extract_images(markup, base_url, limit=1)
+    return imgs[0] if imgs else ""
+
+
+def _pick_item_image(raw, link=""):
+    """RSS 单条目里找配图：media:content / media:thumbnail / enclosure → 正文首图"""
+    for pat in (r"""<media:content\b[^>]*\burl=["']([^"']+)["']""",
+                r"""<media:thumbnail\b[^>]*\burl=["']([^"']+)["']""",
+                r"""<enclosure\b[^>]*\burl=["']([^"']+)["']"""):
+        m = re.search(pat, raw, re.I)
+        if m:
+            u = html_lib.unescape(m.group(1).strip())
+            if _looks_like_image_url(u):
+                try:
+                    return urllib.parse.urljoin(link or "", u)
+                except Exception:
+                    return ""
+    for tag in ("content:encoded", "description"):
+        m = re.search(r"<%s[^>]*>(.*?)</%s>" % (tag, tag), raw, re.S | re.I)
+        if not m:
+            continue
+        body = re.sub(r"^<!\[CDATA\[(.*?)\]\]>$", r"\1", m.group(1).strip(), flags=re.S)
+        u = _extract_first_img(body, link)
+        if u:
+            return u
+    return ""
+
+
+def _parse_rss_items(xml_text, feed_url=""):
+    """解析 RSS 2.0，返回 [{title, summary, pub, link, image, source}]。用正则而非 XML 解析，
     避免个别源的非法字符/命名空间导致整个解析失败。"""
     items = []
+    src = _source_name(feed_url)
     for raw in re.findall(r"<item[\s>].*?</item>", xml_text, re.S):
         def pick(tag):
             m = re.search(r"<%s[^>]*>(.*?)</%s>" % (tag, tag), raw, re.S)
@@ -78,11 +191,14 @@ def _parse_rss_items(xml_text):
         title = pick("title")
         if not title:
             continue
+        link = pick("link")
         items.append({
             "title": title,
             "summary": pick("description")[:220],
             "pub": pick("pubDate"),
-            "link": pick("link"),
+            "link": link,
+            "image": _pick_item_image(raw, link),
+            "source": src,
         })
     return items
 
@@ -121,15 +237,18 @@ def probe_news_feeds(today_date):
         if not xml_text:
             out.append({"feed": url, "ok": False, "items": 0, "latest": "", "today_items": 0})
             continue
-        its = _parse_rss_items(xml_text)
+        its = _parse_rss_items(xml_text, url)
         dates = [_pub_to_bj_date(it["pub"]) for it in its]
         dates = [d for d in dates if d]
+        today_its = [it for it in its if _pub_to_bj_date(it["pub"]) == today_date]
         out.append({
             "feed": url,
             "ok": True,
             "items": len(its),
             "latest": str(max(dates)) if dates else "",
-            "today_items": sum(1 for d in dates if d == today_date),
+            "today_items": len(today_its),
+            # 诊断：今天这批条目里有多少自带头图（决定要不要走 og:image 兜底）
+            "today_with_image": sum(1 for it in today_its if it.get("image")),
         })
     return out
 
@@ -143,7 +262,7 @@ def get_today_news_materials(today_date, limit=6):
         xml_text = _fetch_rss(url)
         if not xml_text:
             continue
-        for it in _parse_rss_items(xml_text):
+        for it in _parse_rss_items(xml_text, url):
             if _pub_to_bj_date(it["pub"]) != today_date:
                 continue
             blob = it["title"] + " " + it["summary"]
@@ -177,7 +296,8 @@ def format_news_material(materials, today_cn):
     lines = ["【今日素材】（以下均为「{}」当天由媒体发布的报道，是本次写作的**唯一**事实来源）"
              .format(today_cn)]
     for i, it in enumerate(materials, 1):
-        lines.append("{}. 标题：{}\n   摘要：{}".format(i, it["title"], it["summary"] or "（无摘要）"))
+        lines.append("{}. 〔{}〕标题：{}\n   摘要：{}".format(
+            i, it.get("source") or "媒体", it["title"], it["summary"] or "（无摘要）"))
     return "\n".join(lines)
 
 
@@ -433,8 +553,8 @@ def get_unsplash_image_url(access_key, keyword, offset=0):
 
 
 def get_unsplash_image_urls(access_key, keyword, count=10, page=1):
-    """按关键词返回若干候选图 [{id, url}]，用于「换一张没用过的图」。
-    id 取 Unsplash 的 photo id，便于跨天去重。"""
+    """按关键词返回若干候选图 [{id, url, alt, desc}]，用于「换一张没用过的图」。
+    id 取 Unsplash 的 photo id，便于跨天去重；alt/desc 是英文图注，用来判断图文是否搭配。"""
     params = urllib.parse.urlencode({
         "query": keyword,
         "per_page": max(1, min(count, 30)),
@@ -452,21 +572,251 @@ def get_unsplash_image_urls(access_key, keyword, count=10, page=1):
             data = json.loads(resp.read().decode("utf-8"))
         for r in data.get("results", []):
             u = (r.get("urls") or {}).get("regular")
-            if u:
-                out.append({"id": "unsplash:" + str(r.get("id", u)), "url": u})
+            if not u:
+                continue
+            out.append({
+                "id": "unsplash:" + str(r.get("id", u)),
+                "url": u,
+                "alt": (r.get("alt_description") or "").strip(),
+                "desc": (r.get("description") or "").strip(),
+            })
     except Exception:
         pass
     return out
 
 
-def download_image(url):
-    """下载图片二进制内容，返回 (bytes, content_type)；失败返回 (None, None)"""
+_UA_DESKTOP = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+
+def download_image(url, referer="", timeout=10):
+    """下载图片二进制内容，返回 (bytes, content_type)；非图片/超限/异常返回 (None, None)。
+    新闻站图床（尤其微信 mmbiz）有防盗链，必须带原文 Referer 才肯给图。"""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.read(), resp.headers.get("Content-Type", "image/jpeg")
+        headers = {"User-Agent": _UA_DESKTOP, "Accept": "image/*,*/*;q=0.8"}
+        if referer:
+            headers["Referer"] = referer
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if ctype and not ctype.startswith("image/"):
+                return None, None
+            data = resp.read(IMAGE_MAX_BYTES + 1)
+        if not data or len(data) > IMAGE_MAX_BYTES:
+            return None, None
+        return data, ctype or "image/jpeg"
     except Exception:
         return None, None
+
+
+# 「文字/界面截图」识别阈值：白底占比 + 笔画边缘密度
+TEXTY_WHITE = 0.30        # 近白像素占比上限（截图/表格通常 > 0.7）
+TEXTY_EDGE = 0.05         # 白底图还要边缘够密才算文字图（白底产品图边缘很少）
+TEXTY_EDGE_ONLY = 0.22    # 不看底色：边缘极密的基本是文字（含深色底代码截图）
+TEXTY_TALL_RATIO = 1.5    # 高/宽 ≥ 1.5 视为竖长截图
+
+
+def image_texty(img_bytes, max_width=360):
+    """判断配图是不是「文字/界面截图」类封面（榜单、表格、后台截图、代码截图等）。
+    这类图不适合当新闻封面，调用方应跳过它并降级到 Unsplash。
+    没有 Pillow 或解码失败时返回 False（放行原图），任何情况都不抛异常。"""
+    if not _HAS_PIL or not img_bytes:
+        return False
+    try:
+        im = _PILImage.open(io.BytesIO(img_bytes))
+        im.load()
+        w0, h0 = im.size
+        if not w0 or not h0:
+            return False
+        if h0 >= w0 * TEXTY_TALL_RATIO:
+            return True
+        if w0 < 400 or h0 < 200:
+            return True   # 尺寸太小，铺到 200px 高的卡片里会糊
+        if w0 <= 600 and h0 <= 600:
+            return True   # 小尺寸方图多是表情/图标，当封面不体面
+        g = im.convert("L")
+        w, h = g.size
+        if w > max_width:
+            g = g.resize((max_width, max(1, int(h * max_width / float(w)))),
+                         _PILImage.BILINEAR)
+        w, h = g.size
+        total = float(w * h)
+        hist = g.histogram()
+        white = sum(hist[235:]) / total
+        edge_hist = g.filter(_PILFilter.FIND_EDGES).histogram()
+        edge = sum(edge_hist[40:]) / total
+        if white > TEXTY_WHITE and edge > TEXTY_EDGE:
+            return True
+        return edge > TEXTY_EDGE_ONLY
+    except Exception:
+        return False
+
+
+_EN_STOP = {"the", "and", "for", "with", "from", "into", "over", "that", "this",
+            "are", "was", "were", "has", "have", "his", "her", "its", "a", "an",
+            "of", "in", "on", "at", "to", "by", "is", "as", "or", "new", "top",
+            # 这些词几乎出现在每张图注里，留下它们等于不筛选
+            "technology", "digital", "computer", "model", "models", "data", "system",
+            "software", "concept", "background", "abstract", "business", "people",
+            "person", "man", "woman", "image", "photo", "photograph", "screen"}
+
+
+def _kw_tokens(keyword):
+    """把英文关键词拆成有指向性的实词（去掉介词、泛化词）"""
+    toks = re.split(r"[^A-Za-z0-9]+", (keyword or "").lower())
+    return [t for t in toks if len(t) >= 3 and t not in _EN_STOP]
+
+
+def _unsplash_matches(cand, keyword):
+    """Unsplash 候选的英文图注是否真和关键词沾边，用来挡掉「搜 AI 返回一张海景」这类。
+    一个实词都不沾、或者压根没有图注，都算不搭——宁可这条新闻没有配图。"""
+    toks = _kw_tokens(keyword)
+    if not toks:
+        return False
+    text = " ".join([cand.get("alt") or "", cand.get("desc") or ""]).lower()
+    if not text.strip():
+        return False
+    return any(re.search(r"\b" + re.escape(t), text) for t in toks)
+
+
+# ============ 新闻原图（报道自带头图） ============
+def _title_sim(a, b):
+    """覆盖率相似度（字符二元组交集 / 较短集合）：DeepSeek 会改写标题，
+    用 Jaccard 会低估，这里只算「较短文本有多大比例出现在较长的文本里」"""
+    def grams(s):
+        s = re.sub(r"[\s\W_]+", "", (s or "").lower())
+        return set(s[i:i + 2] for i in range(max(0, len(s) - 1)))
+    ga, gb = grams(a), grams(b)
+    if not ga or not gb:
+        return 0.0
+    return len(ga & gb) / float(min(len(ga), len(gb)))
+
+
+def _fetch_page_images(page_url, timeout=6, limit=2):
+    """抓原文页的头图候选：只取正文最前面 1-2 张（头图/开场配图），
+    再补 og:image/twitter:image。文章中间那些插图常是表格、示例截图，
+    和新闻主题并不搭配，所以不往里翻。
+    返回 URL 列表（可能为空），失败不抛异常。"""
+    if not page_url:
+        return []
+    try:
+        req = urllib.request.Request(page_url, headers={
+            "User-Agent": _UA_DESKTOP,
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            page = resp.read(400 * 1024).decode("utf-8", "ignore")
+    except Exception:
+        return []
+    urls = _extract_images(page, page_url, limit=limit)
+    # og:image / twitter:image 作为最后候选（有的站点正文图是懒加载，HTML 里没有）
+    for pat in (r"""<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']""",
+                r"""<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']""",
+                r"""<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']"""):
+        m = re.search(pat, page, re.I)
+        if not m:
+            continue
+        u = html_lib.unescape(m.group(1).strip())
+        if not _looks_like_image_url(u):
+            continue
+        try:
+            u = urllib.parse.urljoin(page_url, u)
+        except Exception:
+            continue
+        if u not in urls:
+            urls.append(u)
+        break
+    return urls
+
+
+_ENTITY_STOP = {"ai", "a.i", "it", "in", "on", "of", "and", "the", "is", "new",
+                "app", "api", "pc", "ios", "android", "us", "uk", "ceo", "2026", "2025"}
+
+
+def _entity_sim(a, b):
+    """英文/数字实体词重合度（公司名、模型名、金额、版本号）。
+    这类词在 DeepSeek 改写后基本会保留，是比标题相似度更硬的信号。"""
+    pat = r"[A-Za-z][A-Za-z0-9\.\-]{1,}|\d+(?:\.\d+)?"
+    ta = set(w.lower().strip(".-") for w in re.findall(pat, a or "")) - _ENTITY_STOP
+    tb = set(w.lower().strip(".-") for w in re.findall(pat, b or "")) - _ENTITY_STOP
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / float(min(len(ta), len(tb)))
+
+
+def _match_material(items, materials):
+    """给每条新闻找对应素材：先用模型标注的「素材：N」，缺失时按标题相似度补位"""
+    pairs, used = {}, set()
+    for i, it in enumerate(items):
+        idx = it.get("material_idx") or 0
+        if 1 <= idx <= len(materials) and (idx - 1) not in used:
+            pairs[i] = materials[idx - 1]
+            used.add(idx - 1)
+    for i, it in enumerate(items):
+        if i in pairs:
+            continue
+        best_j, best_s = None, 0.0
+        for j, m in enumerate(materials):
+            if j in used:
+                continue
+            # 标题为主，正文与素材摘要的重合度做加成（改写后标题常偏离原题）
+            s = max(_title_sim(it.get("title", ""), m.get("title", "")),
+                    _title_sim((it.get("title", "") + " " + (it.get("detail") or ""))[:160],
+                               m.get("title", "") + " " + (m.get("summary") or "")) * 0.9)
+            # 实体词（公司名/模型名/金额）命中是非常硬的信号，直接给高分
+            es = _entity_sim((it.get("title", "") + " " + (it.get("detail") or ""))[:160],
+                             m.get("title", "") + " " + (m.get("summary") or ""))
+            if es >= 0.5:
+                s = max(s, 0.6)
+            if s > best_s:
+                best_j, best_s = j, s
+        if best_j is not None and best_s >= 0.25:
+            pairs[i] = materials[best_j]
+            used.add(best_j)
+    return pairs
+
+
+def pick_news_source_images(items, materials, deadline):
+    """为每条新闻准备原图候选：RSS 自带图 → 原文页头图/C 位图 → og:image。
+    只取头图区，不往文章中间翻（中间插图经常是表格、示例截图，与新闻不搭配）。
+    deadline 为 time.monotonic() 截止点，剩余时间不够就少抓几条、直接降级 Unsplash。
+    任何异常都内部吞掉（不影响推送），返回 {item_index: {urls, credit, referer}}"""
+    out = {}
+    try:
+        pairs = _match_material(items, materials)
+    except Exception:
+        return out
+    if not pairs:
+        return out
+
+    need = [(i, m) for i, m in pairs.items() if not m.get("image") and m.get("link")]
+    page_imgs = {}
+    remain = deadline - time.monotonic()
+    if need and remain > 1:
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+                futs = {ex.submit(_fetch_page_images, m["link"], min(6, remain), 2): i
+                        for i, m in need}
+                for f in concurrent.futures.as_completed(
+                        futs, timeout=max(1, min(remain, 25))):
+                    try:
+                        page_imgs[futs[f]] = f.result() or []
+                    except Exception:
+                        page_imgs[futs[f]] = []
+        except Exception:
+            pass   # 超时/异常：已经拿到几条算几条
+
+    for i, m in pairs.items():
+        urls = []
+        if m.get("image"):
+            urls.append(m["image"])
+        for u in page_imgs.get(i, []):
+            if u not in urls:
+                urls.append(u)
+        if urls:
+            out[i] = {"urls": urls, "credit": m.get("source", ""),
+                      "referer": m.get("link", "")}
+    return out
 
 
 def get_word_audio_b64(word):
@@ -489,12 +839,23 @@ def build_html(news_items, title, date_str, date_info="", festivals=None):
     for idx, item in enumerate(news_items, 1):
         # 1-3 张图，横向滑动轮播；固定高度 + cover 裁剪，保证尺寸一致
         imgs_b64 = item.get("imgs_b64") or []
+        metas = item.get("imgs_meta") or []
         img_html = ""
         if imgs_b64:
             slides = []
             dots = []
             for bi, b64 in enumerate(imgs_b64):
-                data_uri = "data:image/jpeg;base64," + b64
+                mt = metas[bi] if bi < len(metas) else {}
+                ctype = (mt.get("ctype") or "image/jpeg").lower()
+                if "png" in ctype:
+                    ctype = "image/png"
+                elif "webp" in ctype:
+                    ctype = "image/webp"
+                elif "gif" in ctype:
+                    ctype = "image/gif"
+                else:
+                    ctype = "image/jpeg"
+                data_uri = "data:{};base64,{}".format(ctype, b64)
                 slides.append(
                     '<div style="flex:0 0 100%;width:100%;height:200px">'
                     '<img src="{src}" onclick="showZoom(this.src)" '
@@ -524,7 +885,17 @@ def build_html(news_items, title, date_str, date_info="", festivals=None):
                     .format(slides[0])
                 )
         cards += '<div style="margin-bottom:24px;padding:20px;background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.08)">'
-        cards += img_html
+        # 图源标注（新闻原图属各家媒体，标一下来源）
+        credit = ""
+        for mt in metas:
+            if mt.get("credit"):
+                credit = mt["credit"]
+                break
+        credit_html = ""
+        if credit:
+            credit_html = ('<div style="margin:-8px 0 10px;color:#9aa0a6;font-size:12px;'
+                           'text-align:right">图源：{}</div>').format(credit)
+        cards += img_html + credit_html
         cards += '<h3 style="margin:0 0 8px;color:#1a1a1a;font-size:18px">{}</h3>'.format(item.get("title", ""))
         cards += '<p style="margin:0;color:#444;font-size:15px;line-height:1.8">{}</p>'.format(item.get("detail", ""))
         cards += '</div>'
@@ -884,14 +1255,17 @@ TASKS = {
             "3. 素材不够 3 条时，有几条写几条，宁可只发 1-2 条，也绝不编造凑数。\n"
             "4. 标题必须具体：写清是哪家公司/哪个模型/什么产品做了什么事，"
             "不要用「AI 领域再获突破」这类空泛表述。\n"
-            "5. 每条详情后面单独加一行英文配图关键词，格式「关键词：xxx」，"
-            "用 2-4 个英文单词指向该新闻的具体主体（公司名/模型名/产品名），"
-            "例如 关键词：nvidia data center gpu、关键词：deepseek open source model，"
-            "不要用 AI、technology 这类宽泛词。\n"
-            "格式严格如下（每条三行：标题、详情、关键词）：\n"
-            "1. 标题\n标题的详细内容介绍。\n关键词：nvidia data center gpu\n"
-            "2. 标题\n详细内容。\n关键词：...\n"
-            "3. 标题\n详细内容。\n关键词：...\n"
+            "5. 每条详情后面单独加一行英文配图关键词，格式「关键词：A, B」，用逗号分隔给两个：\n"
+            "   A = 主体 + 具体实物/场景，2-4 个英文词（如 nvidia gpu server rack、laptop running code）；\n"
+            "   B = 只描述能拍到的画面，2-3 个英文词（如 server room、robot arm、doctor with tablet）。\n"
+            "   不要只写公司名、模型名或产品代号——图库里根本没有这类照片；"
+            "两个都别用 AI、technology、model 这类宽泛词。\n"
+            "6. 关键词行下面再加一行「素材：N」，N 是上面素材列表里这条新闻对应的编号"
+            "（用来取该报道的原图）。实在对不上编号就写「素材：0」。\n"
+            "格式严格如下（每条四行：标题、详情、关键词、素材）：\n"
+            "1. 标题\n标题的详细内容介绍。\n关键词：nvidia gpu server rack, server room\n素材：1\n"
+            "2. 标题\n详细内容。\n关键词：...\n素材：2\n"
+            "3. 标题\n详细内容。\n关键词：...\n素材：3\n"
             "直接输出，不要额外说明。"
         ),
     },
@@ -981,11 +1355,13 @@ def parse_news(text, default_title="今日 AI 新闻"):
                     if len(tail.strip()) >= 40:
                         title, detail = head.strip(), tail.strip()
                     break
-            current = {"title": title, "detail": detail, "img_kw": "", "img_kws": []}
+            current = {"title": title, "detail": detail, "img_kw": "", "img_kws": [],
+                       "material_idx": 0}
             items.append(current)
         elif line.startswith("#"):
             title = line.lstrip("#").strip()
-            current = {"title": title, "detail": "", "img_kw": "", "img_kws": []}
+            current = {"title": title, "detail": "", "img_kw": "", "img_kws": [],
+                       "material_idx": 0}
             items.append(current)
         elif current is not None:
             # 提取配图关键词行：关键词：xxx / 关键词:xxx（支持逗号分隔多个）
@@ -994,10 +1370,27 @@ def parse_news(text, default_title="今日 AI 新闻"):
                 kws = [k.strip() for k in kw_text.replace("，", ",").split(",") if k.strip()]
                 current["img_kws"] = kws
                 current["img_kw"] = kws[0] if kws else ""
+            elif line.startswith("素材") or line.startswith("来源编号"):
+                # 模型标注的素材编号，用来取该报道的原始头图
+                m = re.search(r"\d+", line)
+                current["material_idx"] = int(m.group(0)) if m else 0
+            elif re.match(r"^[（(【\[]?\s*(素材|来源编号)\s*[：:]", line):
+                m = re.search(r"\d+", line)
+                current["material_idx"] = int(m.group(0)) if m else 0
             else:
                 current["detail"] = (current["detail"] + " " + line).strip()
     if not items:
-        items = [{"title": default_title, "detail": text, "img_kw": "", "img_kws": []}]
+        items = [{"title": default_title, "detail": text, "img_kw": "", "img_kws": [],
+                  "material_idx": 0}]
+    # 兜底：模型若把「素材：N」写进详情行，取编号并把该片段从正文里清掉
+    for it in items:
+        detail = it.get("detail", "") or ""
+        m = re.search(r"(?:素材|来源编号)\s*[：:]\s*(\d+)", detail)
+        if m:
+            if not it.get("material_idx"):
+                it["material_idx"] = int(m.group(1))
+            it["detail"] = re.sub(
+                r"[（(【\[]?\s*(?:素材|来源编号)\s*[：:]\s*\d+\s*[）)】\]]?", "", detail).strip()
     return items[:3]
 
 
@@ -1889,6 +2282,28 @@ def get_date_info(today):
     return " · ".join(parts)
 
 
+def _resolve_event_date(event):
+    """支持事件里带 {"date":"YYYY-MM-DD"}：用于补发某天/回测配图，定时触发器不会带这个字段。
+    格式不合法就当没传，仍按北京时间今天跑。"""
+    obj = None
+    if isinstance(event, dict):
+        obj = event
+    elif isinstance(event, str) and event.strip().startswith("{"):
+        try:
+            obj = json.loads(event)
+        except Exception:
+            obj = None
+    if not isinstance(obj, dict):
+        return None
+    v = obj.get("date")
+    if not v:
+        return None
+    try:
+        return dt.datetime.strptime(str(v).strip(), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
 def _resolve_task_name(event):
     """从事件里解析 task 名，兼容三种格式：
     1. 控制台测试事件：{"task":"words"}
@@ -1959,6 +2374,13 @@ def main_handler(event, context):
     # 用北京时间（UTC+8）计算今天，避免云函数 UTC 时区导致日期偏差
     today = (dt.datetime.utcnow() + dt.timedelta(hours=8)).strftime("%Y-%m-%d")
     today_date = (dt.datetime.utcnow() + dt.timedelta(hours=8)).date()
+
+    # 补发/回测：事件里显式带 {"date":"2026-11-23"} 就按指定日期跑（定时触发器不会带）
+    override = _resolve_event_date(event)
+    if override:
+        today_date = override
+        today = today_date.strftime("%Y-%m-%d")
+
     today_cn = today_date.strftime("%Y年%m月%d日")
     # 农历 + 节气 + 节日信息
     date_info = get_date_info(today_date)
@@ -1974,8 +2396,10 @@ def main_handler(event, context):
             "errmsg": "ok",
             "today": today,
             "materials": len(mats),
+            "materials_with_image": sum(1 for it in mats if it.get("image")),
             "titles": [it["title"] for it in mats],
             "feeds": probe_news_feeds(today_date),
+            "pil": _HAS_PIL,   # False 表示没带 Pillow，「文字截图」识别会自动跳过
         }
 
     task = TASKS[task_name]
@@ -2131,8 +2555,9 @@ def main_handler(event, context):
         festivals_info = []
 
     # 2. 每条必搜 1 张图（多级兜底，保证一定有图）：
+    #    新闻板块：报道自己的头图/og:image（强相关、几乎不跨天重复）→ 拿不到才走 Unsplash
     #    历史板块：Wikimedia 历史照片(强相关) → Unsplash 精准词 → Unsplash 标题词 → Unsplash 默认词
-    #    非历史板块：Unsplash 精准词 → 标题词 → 默认词
+    #    其他板块：Unsplash 精准词 → 标题词 → 默认词
     #    跨天去重：Unsplash 按关键词搜到的头部结果每天几乎一样，所以把用过的图 id
     #    记在 COS（images/used_images.json），本次优先挑「没出现过」的候选。
     unsplash_key = os.getenv("UNSPLASH_ACCESS_KEY", "")
@@ -2140,8 +2565,18 @@ def main_handler(event, context):
     used_ids, history_ids = load_image_history(secret_id, secret_key, bucket, region)
     new_ids = []
 
+    # 新闻原图候选：一次算好（含并发抓 og:image），整体受 NEWS_IMG_BUDGET 秒约束
+    src_img_map = {}
+    img_deadline = time.monotonic() + NEWS_IMG_BUDGET
+    if task_name == "news" and materials:
+        try:
+            src_img_map = pick_news_source_images(items, materials, img_deadline)
+        except Exception:
+            src_img_map = {}
+
     for i, item in enumerate(items):
         item["imgs_b64"] = []
+        item["imgs_meta"] = []
         kws = item.get("img_kws") or []
         kw = kws[0].strip() if kws else ""
 
@@ -2161,7 +2596,7 @@ def main_handler(event, context):
         if task.get("default_kw") and task["default_kw"] not in cand_kws:
             cand_kws.append(task["default_kw"])
 
-        def _take(img_bytes, img_id):
+        def _take(img_bytes, img_id, credit="", ctype="image/jpeg"):
             """下载成功且未被用过就收下这张图"""
             md5 = hashlib.md5(img_bytes).hexdigest()
             if md5 in used_md5:
@@ -2170,10 +2605,56 @@ def main_handler(event, context):
             used_ids.add(img_id)
             new_ids.append(img_id)
             item["imgs_b64"].append(base64.b64encode(img_bytes).decode("ascii"))
+            item["imgs_meta"].append({"credit": credit, "ctype": ctype or "image/jpeg"})
             return True
 
-        # 逐级尝试搜图，直到拿到一张成功下载且不重复的图
+        # 0. 优先用报道原图（最相关，也最不可能和前几天撞图）
         got = False
+        si = src_img_map.get(i)
+        if si:
+            urls = si.get("urls", [])
+            # 没用过的优先，实在都出现过再用旧的（原图仍然比关键词搜图更贴题）
+            ordered = [u for u in urls if _img_id_for_url(u) not in used_ids] + \
+                      [u for u in urls if _img_id_for_url(u) in used_ids]
+            for u in ordered:
+                left = img_deadline - time.monotonic()
+                if left <= 0:
+                    break   # 预算用尽，剩下的交给 Unsplash
+                try:
+                    img_bytes, ctype = download_image(
+                        u, referer=si.get("referer", ""), timeout=max(3, min(8, left)))
+                except Exception:
+                    continue
+                if not img_bytes:
+                    continue
+                if image_texty(img_bytes):
+                    continue   # 文字/界面截图不适合当封面，换下一张候选
+                if _take(img_bytes, _img_id_for_url(u), si.get("credit", ""), ctype):
+                    got = True
+                    break
+
+        # 原图候选全失败时，再抓一次原文页（RSS 图挂防盗链/失效的兜底）
+        if not got and si and si.get("referer") and time.monotonic() < img_deadline:
+            try:
+                left = img_deadline - time.monotonic()
+                again = _fetch_page_images(si["referer"], timeout=max(3, min(6, left)), limit=2)
+                for u in again:
+                    if u in si.get("urls", []):
+                        continue
+                    if time.monotonic() > img_deadline:
+                        break
+                    img_bytes, ctype = download_image(
+                        u, referer=si["referer"],
+                        timeout=max(3, min(8, img_deadline - time.monotonic())))
+                    if not img_bytes or image_texty(img_bytes):
+                        continue
+                    if _take(img_bytes, _img_id_for_url(u), si.get("credit", ""), ctype):
+                        got = True
+                        break
+            except Exception:
+                pass
+
+        # 逐级尝试搜图，直到拿到一张成功下载且不重复的图
         for ck in cand_kws:
             if got:
                 break
@@ -2187,7 +2668,7 @@ def main_handler(event, context):
                     img_bytes, ctype = download_image(u)
                     if not img_bytes:
                         continue
-                    if _take(img_bytes, _img_id_for_url(u)):
+                    if _take(img_bytes, _img_id_for_url(u), "Wikimedia", ctype):
                         got = True
                         break
             if got:
@@ -2198,12 +2679,20 @@ def main_handler(event, context):
                 fresh = [c for c in cands if c["id"] not in used_ids]
                 stale = [c for c in cands if c["id"] in used_ids]
                 for cand in fresh + stale:
-                    img_bytes, ctype = download_image(cand["url"])
-                    if not img_bytes:
+                    # 新闻板块：图注和关键词一个实词都不沾就别用，宁可这条没有配图
+                    if task_name == "news" and not _unsplash_matches(cand, ck):
                         continue
-                    if _take(img_bytes, cand["id"]):
+                    img_bytes, ctype = download_image(cand["url"])
+                    if not img_bytes or image_texty(img_bytes):
+                        continue
+                    if _take(img_bytes, cand["id"], "Unsplash", ctype):
                         got = True
                         break
+
+        # 诊断日志：每条新闻用了什么关键词、最后配的是原图 / Unsplash / 没图
+        print("[img] #%d kw=%s -> %s" % (
+            i + 1, " | ".join(kws[:2]) or "(none)",
+            (item["imgs_meta"][0].get("credit") or "?") if item["imgs_meta"] else "无图"))
 
     # 记录本次用过的图 id，供以后几天继续避开（失败不影响推送）
     if new_ids:
